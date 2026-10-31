@@ -91,9 +91,39 @@ This is antivirus/Defender file-locking racing bun's rename of extracted temp di
 
 ## 4. Typecheck
 
+Typecheck runs [typescript-go](https://github.com/microsoft/typescript-go) (`tsgo`) through Turborepo:
+
 ```sh
-bun turbo typecheck
+bun turbo typecheck --concurrency=1
 ```
+
+### Windows: why `--concurrency=1` (tsgo OOM)
+
+The three largest packages (`@kilocode/cli`, `@opencode-ai/app`, `@opencode-ai/desktop`) each spawn a `tsgo` process that can consume several GB of RAM. When turbo runs them **in parallel** (the default), the processes crash with:
+
+```
+fatal error: out of memory
+runtime: cannot allocate memory
+    github.com/microsoft/typescript-go/internal/execute/tsc.EmitFilesAndReportErrors
+```
+
+Fix — run one typecheck at a time (verified: 10/10 tasks pass). Cached tasks stay cached between runs, so a serial re-run only re-executes the packages that OOM'd.
+
+### Windows: git symlinks break typecheck (TS1128)
+
+This repo contains ~42 git symlinks (git file mode `120000`). On Windows, git defaults to `core.symlinks=false`, so symlinks are checked out as **plain text files whose content is the target path string**. `packages/app/src/custom-elements.d.ts` is one of them, and tsc then fails with:
+
+```
+src/custom-elements.d.ts(1,1): error TS1128: Declaration or statement expected.
+```
+
+Fix — overwrite the placeholder with the real target's content (the symlink points into `packages/ui`):
+
+```powershell
+Copy-Item 'packages/ui/src/custom-elements.d.ts' 'packages/app/src/custom-elements.d.ts' -Force
+```
+
+Only this one symlink blocks typecheck (the rest live under `public/`, fonts, images). The systemic alternative: enable Windows Developer Mode, then `git config core.symlinks true` and re-checkout.
 
 ## 5. Run
 
@@ -170,6 +200,19 @@ See §3 above — same-drive `BUN_INSTALL_CACHE_DIR` + retry loop + optional Def
 ### f) Long-running commands exceeding tool timeouts
 
 When driving installs/builds from an automated harness with short timeouts, run the command in the background writing to a log file, then poll the log **directly** (no nested sleeps — the poll itself will be backgrounded). Check process liveness with a CPU-delta sample: if CPU is identical across two samples minutes apart, the process is hung, not working — kill and retry.
+
+### g) turbo can't find the package manager ("Unable to find package manager binary")
+
+Turbo shells out to `bun` by name. When bun lives outside `PATH` (e.g. a portable copy), prepend its directory first:
+
+```powershell
+$env:PATH = "<bun-dir>;" + $env:PATH
+bun turbo typecheck --concurrency=1
+```
+
+### h) typescript-go OOM during parallel typecheck
+
+See §4 — use `bun turbo typecheck --concurrency=1`. Turbo caches successful typechecks, so serial re-runs only re-execute the packages that previously OOM'd.
 
 ## Repository Conventions
 
