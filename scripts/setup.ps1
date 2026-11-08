@@ -5,7 +5,8 @@
 .DESCRIPTION
     Validates prerequisites, configures a same-drive Bun cache (Windows EPERM
     mitigation), ensures git remotes, runs a resilient `bun install` retry loop,
-    and finishes with a typecheck.
+    repairs Windows git-symlink placeholders that break typecheck, and finishes
+    with a serial (--concurrency=1) typecheck.
 .PARAMETER RepoRoot
     Path to the repository root. Defaults to the directory containing this script's parent.
 .PARAMETER ForkUrl
@@ -23,6 +24,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+if (-not (Test-Path $RepoRoot -PathType Container)) {
+    throw "RepoRoot '$RepoRoot' does not exist or is not a directory."
+}
+$RepoRoot = (Resolve-Path $RepoRoot).Path
 
 function Write-Step {
     param([string]$Message)
@@ -59,11 +65,15 @@ if (-not $bunExe -or -not (Test-Path $bunExe)) {
 }
 
 $bunVersionOutput = & $bunExe --version 2>&1
-$bunVersion = [version]($bunVersionOutput | Select-Object -First 1)
-if ($bunVersion -lt [version]'1.3.9') {
+$versionText = "$($bunVersionOutput | Select-Object -First 1)".Trim()
+$bunVersion = $null
+if (-not [version]::TryParse(($versionText -split '-')[0], [ref]$bunVersion)) {
+    Write-Warning "Could not parse Bun version output '$versionText'; skipping the version check."
+}
+elseif ($bunVersion -lt [version]'1.3.9') {
     Write-Warning "Bun $bunVersion found; this repo pins bun@1.3.9 via packageManager. Proceeding, but use >= 1.3.9."
 }
-Write-Info "Bun $bunVersion at $bunExe"
+Write-Info "Bun $versionText at $bunExe"
 
 # ---------------------------------------------------------------------------
 # 2. Same-drive Bun cache (Windows EPERM mitigation)
@@ -90,20 +100,26 @@ Write-Step "Ensuring git remotes"
 function Ensure-Remote {
     param([string]$Name, [string]$Url)
     $existing = git -C $RepoRoot remote get-url $Name 2>$null
-    if ($LASTEXITCODE -ne 0) {
+    if ($LASTEXITCODE -eq 0) {
+        if ($ForkUrl -and $Name -eq 'origin' -and $existing -ne $ForkUrl) {
+            git -C $RepoRoot remote set-url $Name $ForkUrl
+            Write-Info "Set remote $Name -> $ForkUrl"
+        }
+        else {
+            Write-Info "Remote $Name already set to $existing"
+        }
+        return
+    }
+    if ($Url) {
         git -C $RepoRoot remote add $Name $Url
         Write-Info "Added remote $Name -> $Url"
     }
-    elseif ($ForkUrl -and $Name -eq 'origin') {
-        git -C $RepoRoot remote set-url $Name $Url
-        Write-Info "Set remote $Name -> $Url"
-    }
     else {
-        Write-Info "Remote $Name already set to $existing"
+        Write-Warning "Remote '$Name' is not configured and no URL was provided; skipping."
     }
 }
 
-Ensure-Remote -Name 'origin' -Url $(if ($ForkUrl) { $ForkUrl } else { (git -C $RepoRoot remote get-url origin 2>$null); if ($LASTEXITCODE -ne 0) { 'https://github.com/<YOU>/kilo.git' } })
+Ensure-Remote -Name 'origin' -Url $ForkUrl
 Ensure-Remote -Name 'upstream' -Url 'https://github.com/Kilo-Org/kilo.git'
 
 # ---------------------------------------------------------------------------
@@ -111,39 +127,73 @@ Ensure-Remote -Name 'upstream' -Url 'https://github.com/Kilo-Org/kilo.git'
 # ---------------------------------------------------------------------------
 Write-Step "Installing dependencies (up to $MaxInstallAttempts attempts)"
 
-$installed = $false
-for ($i = 1; $i -le $MaxInstallAttempts; $i++) {
-    Write-Info "Attempt $i of $MaxInstallAttempts..."
+Push-Location $RepoRoot
+try {
+    $installed = $false
+    for ($i = 1; $i -le $MaxInstallAttempts; $i++) {
+        Write-Info "Attempt $i of $MaxInstallAttempts..."
 
-    # Clear stuck dot-prefixed temp dirs from a previous failed rename
-    Get-ChildItem $env:BUN_INSTALL_CACHE_DIR -Directory -Filter '.*' -ErrorAction SilentlyContinue |
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        # Clear stuck dot-prefixed temp dirs from a previous failed rename
+        Get-ChildItem $env:BUN_INSTALL_CACHE_DIR -Directory -Filter '.*' -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
-    & $bunExe install
-    if ($LASTEXITCODE -eq 0) {
-        Write-Info "bun install succeeded."
-        $installed = $true
-        break
+        & $bunExe install
+        if ($LASTEXITCODE -eq 0) {
+            Write-Info "bun install succeeded."
+            $installed = $true
+            break
+        }
+
+        Write-Warning "bun install failed (exit $LASTEXITCODE). Cleaning stale cache temp dirs and retrying..."
+        # Kill any hung bun (rename-hang side effect)
+        Get-Process bun -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
     }
 
-    Write-Warning "bun install failed (exit $LASTEXITCODE). Cleaning stale cache temp dirs and retrying..."
-    # Kill any hung bun (rename-hang side effect)
-    Get-Process bun -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
+    if (-not $installed) {
+        throw "bun install failed after $MaxInstallAttempts attempts. See output above."
+    }
+
+    # -----------------------------------------------------------------------
+    # 5. Windows: repair git-symlink placeholders that break typecheck
+    # -----------------------------------------------------------------------
+    # With core.symlinks=false (the Windows default), git checks symlinks out
+    # as plain text files containing the target path. One of them
+    # (packages/app/src/custom-elements.d.ts) then fails typecheck with TS1128.
+    # Repair it locally and mark it skip-worktree so the repository keeps the
+    # original symlink (compatible with upstream) while the working tree works.
+    Write-Step "Repairing Windows symlink placeholders (if any)"
+
+    $symlinksEnabled = git -C $RepoRoot config core.symlinks
+    if ($symlinksEnabled -ne 'true') {
+        $brokenLink = Join-Path $RepoRoot 'packages/app/src/custom-elements.d.ts'
+        $linkTarget = Join-Path $RepoRoot 'packages/ui/src/custom-elements.d.ts'
+        $linkContent = Get-Content $brokenLink -Raw -ErrorAction SilentlyContinue
+        if ($linkContent -and $linkContent -notmatch 'DIFFS_TAG_NAME') {
+            Copy-Item $linkTarget $brokenLink -Force
+            git -C $RepoRoot update-index --skip-worktree 'packages/app/src/custom-elements.d.ts'
+            Write-Info "Copied symlink target over placeholder and marked skip-worktree (local-only; repo stays compatible with upstream)."
+        }
+        else {
+            Write-Info "No symlink placeholder to repair."
+        }
+    }
+    else {
+        Write-Info "core.symlinks=true; real symlinks are in use."
+    }
+
+    # -----------------------------------------------------------------------
+    # 6. Typecheck (serial: parallel tsgo processes OOM on Windows)
+    # -----------------------------------------------------------------------
+    Write-Step "Typechecking (bun turbo typecheck --concurrency=1)"
+
+    & $bunExe turbo typecheck --concurrency=1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Typecheck failed."
+    }
 }
-
-if (-not $installed) {
-    throw "bun install failed after $MaxInstallAttempts attempts. See output above."
-}
-
-# ---------------------------------------------------------------------------
-# 5. Typecheck
-# ---------------------------------------------------------------------------
-Write-Step "Typechecking (bun turbo typecheck)"
-
-& $bunExe turbo typecheck
-if ($LASTEXITCODE -ne 0) {
-    throw "Typecheck failed."
+finally {
+    Pop-Location
 }
 
 Write-Host "`nSetup complete. Run 'bun dev' to start." -ForegroundColor Green

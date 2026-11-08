@@ -117,13 +117,18 @@ This repo contains ~42 git symlinks (git file mode `120000`). On Windows, git de
 src/custom-elements.d.ts(1,1): error TS1128: Declaration or statement expected.
 ```
 
-Fix — overwrite the placeholder with the real target's content (the symlink points into `packages/ui`):
+Fix — overwrite the placeholder with the real target's content (the symlink points into `packages/ui`), then mark the file `skip-worktree` so the fix stays local:
 
 ```powershell
 Copy-Item 'packages/ui/src/custom-elements.d.ts' 'packages/app/src/custom-elements.d.ts' -Force
+git update-index --skip-worktree 'packages/app/src/custom-elements.d.ts'
 ```
 
+`scripts/setup.ps1` performs both steps automatically and idempotently (guarded on `core.symlinks=false`). The `skip-worktree` bit keeps `git status` clean: the repository keeps the original symlink (git mode `120000`), so it stays **compatible with the original/upstream repository** — the copied content is a local working-tree fix only and must never be committed.
+
 Only this one symlink blocks typecheck (the rest live under `public/`, fonts, images). The systemic alternative: enable Windows Developer Mode, then `git config core.symlinks true` and re-checkout.
+
+> If upstream ever changes that symlink target, refresh the local copy: `git update-index --no-skip-worktree 'packages/app/src/custom-elements.d.ts'`, `git checkout -- 'packages/app/src/custom-elements.d.ts'`, then re-apply the copy and re-set `skip-worktree`.
 
 ## 5. Run
 
@@ -233,4 +238,4 @@ From `CONTRIBUTING.md` / repo config:
 .\scripts\setup.ps1 -RepoRoot . -ForkUrl "https://github.com/<YOU>/kilo.git"
 ```
 
-This validates Bun ≥ 1.3.9, configures the same-drive cache, ensures remotes, runs the install retry loop, and finishes with a typecheck.
+This validates Bun ≥ 1.3.9, configures the same-drive cache, ensures remotes, runs the install retry loop, repairs Windows symlink placeholders (`skip-worktree`), and finishes with a serial typecheck (`--concurrency=1`).
