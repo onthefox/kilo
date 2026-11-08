@@ -5,14 +5,14 @@
   "private": true,
   "type": "module",
   "packageManager": "bun@1.3.9",
-  "scripts": {
+"scripts": {
     "dev": "bun run --cwd packages/opencode --conditions=browser src/index.ts",
     "dev:desktop": "bun --cwd packages/desktop tauri dev",
     "dev:web": "bun --cwd packages/app dev",
     "typecheck": "bun turbo typecheck",
+    "lint": "turbo lint",
+    "format": "prettier --write \"packages/*/src/**/*.{ts,tsx,js,jsx,mjs}\"",
     "prepare": "husky",
-    "random": "echo 'Random script'",
-    "hello": "echo 'Hello World!'",
     "test": "echo 'do not run tests from root' && exit 1"
   },
   "workspaces": {
@@ -62,8 +62,10 @@
       "vite-plugin-solid": "2.11.10"
     }
   },
-  "devDependencies": {
+"devDependencies": {
     "@actions/artifact": "5.0.1",
+    "@commitlint/cli": "19.8.0",
+    "@commitlint/config-conventional": "19.8.0",
     "@tsconfig/bun": "catalog:",
     "husky": "9.1.7",
     "prettier": "3.6.2",

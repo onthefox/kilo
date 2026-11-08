@@ -1,0 +1,13 @@
+#!/usr/bin/env sh
+set -e
+
+# Pre-commit hook: lint staged TypeScript files via prettier
+# Skip if no staged files match
+STAGED=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(ts|tsx|js|jsx|mjs)$' || true)
+
+if [ -z "$STAGED" ]; then
+  exit 0
+fi
+
+echo "husky: running prettier --check on staged files..."
+npx --no-install prettier --check $STAGED
